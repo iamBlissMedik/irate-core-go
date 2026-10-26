@@ -1,0 +1,41 @@
+# golangci-lint v2 — run with `make lint`.
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration]
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose     # HTTP response bodies are closed
+    - errorlint     # errors compared/wrapped with errors.Is/As and %w
+    - gocritic
+    - gosec         # security problems
+    - misspell
+    - nilerr        # returning nil after checking err != nil
+    - noctx         # HTTP requests carry a context
+    - revive
+    - unconvert
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G115 # int64<->int32 conversions are bounded by validation (pagination, amounts)
+    revive:
+      rules:
+        - name: exported
+          disabled: true # handlers/DTOs are self-describing; package docs carry the design notes
+        - name: package-comments
+          disabled: true
+  exclusions:
+    generated: lax # sqlc output (internal/db) is generated
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose, errcheck, gocritic]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/iamBlissMedik/irate-core-go]
