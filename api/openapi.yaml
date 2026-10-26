@@ -1,0 +1,1829 @@
+openapi: 3.1.0
+info:
+  title: iRate Core API
+  version: 1.0.0
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  description: |
+    The iRate fintech wallet & ledger API (Go implementation, `irate-core-go`).
+
+    **Money.** Every amount is an integer number of *minor units* (kobo for NGN:
+    `150000` = NGN 1,500.00). Responses always encode money as a JSON **string**
+    (`"150000"`) so values above 2^53 survive JavaScript clients. Requests accept
+    either a JSON integer (`150000`) or an integer string (`"150000"`); decimals,
+    exponents and signs other than a leading `-` are rejected.
+
+    **Envelope.** Successful responses are `{ "success": true, "message", "data" }`.
+    Failures are `{ "success": false, "message", "code", "errors"?, "requestId" }`.
+    Branch on `code`, never on `message`.
+
+    **Auth.** `POST /api/v1/auth/login` returns a 15-minute JWT access token in
+    the body (send it as `Authorization: Bearer <token>`) and an opaque refresh
+    token in an `HttpOnly; SameSite=Strict` cookie named `refreshToken`, scoped to
+    `/api/v1/auth`. Every refresh rotates the refresh token; re-presenting an
+    already-rotated token outside a short grace window revokes the whole session.
+
+    **Idempotency.** Money-moving endpoints (transfer, admin credit, deposits)
+    require an `Idempotency-Key` header (a fresh UUID per operation). Retrying
+    with the same key and payload replays the original response (with
+    `Idempotent-Replayed: true`) without moving money again; reusing a key with a
+    different payload is rejected with `IDEMPOTENCY_KEY_REUSED`. Failed requests
+    are not cached and may be retried with the same key. Keys are scoped per user
+    and kept for 24 hours.
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+tags:
+  - name: System
+    description: Liveness, readiness and service info.
+  - name: Auth
+    description: Registration, login, session refresh and logout.
+  - name: Users
+    description: Profiles and the customer home-screen overview.
+  - name: Wallets
+    description: Wallet lifecycle and balances.
+  - name: Transactions
+    description: Name enquiry, peer-to-peer transfers and statements.
+  - name: KYC
+    description: Know-Your-Customer submission.
+  - name: Payments
+    description: Wallet funding through an external payment provider.
+  - name: Webhooks
+    description: Inbound, signature-verified payment provider events.
+  - name: Admin
+    description: Back-office operations. **Every route requires the ADMIN role** (403 otherwise).
+
+paths:
+  # ------------------------------------------------------------------ system
+  /:
+    get:
+      tags: [System]
+      operationId: getServiceInfo
+      summary: Service info
+      security: []
+      responses:
+        "200":
+          description: Welcome message and build version.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [version]
+                        properties:
+                          version: { type: string, examples: ["v1.0.0"] }
+              example:
+                success: true
+                message: Welcome to iRate Core (Go)
+                data: { version: v1.0.0 }
+  /health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Liveness probe (alias of /healthz)
+      security: []
+      responses:
+        "200":
+          $ref: "#/components/responses/Liveness"
+  /healthz:
+    get:
+      tags: [System]
+      operationId: getHealthz
+      summary: Liveness probe
+      description: The process is up. Never checks dependencies.
+      security: []
+      responses:
+        "200":
+          $ref: "#/components/responses/Liveness"
+  /readyz:
+    get:
+      tags: [System]
+      operationId: getReadyz
+      summary: Readiness probe
+      description: |
+        Ready to serve traffic: PostgreSQL and Redis reachable and not draining.
+        Returns 503 during graceful shutdown or when a dependency is down.
+      security: []
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example: { status: ready, checks: { database: ok, redis: ok } }
+        "503":
+          description: Draining or a dependency is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              examples:
+                degraded:
+                  value: { status: degraded, checks: { database: ok, redis: unavailable } }
+                draining:
+                  value: { status: draining }
+
+  # -------------------------------------------------------------------- auth
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register a customer
+      description: |
+        Creates a USER and their default-currency wallet atomically. Emails are
+        trimmed and lower-cased. Self sign-up can never create an admin.
+        Rate limited per IP (20/min).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+            example: { email: ada@irate.dev, password: Password123! }
+      responses:
+        "201":
+          description: Registered.
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/X-Request-ID" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/RegisterResult" }
+              example:
+                success: true
+                message: User registered successfully
+                data:
+                  user: { id: 01a1779c-93d6-7a73-b58c-d5ac22826ad5, email: ada@irate.dev, role: USER, createdAt: "2026-10-26T09:48:32.596Z" }
+                  accountNumber: "1000000001"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in
+      description: |
+        Verifies credentials and starts a new session. Returns the access token
+        in the body and sets the `refreshToken` cookie. Unknown emails and wrong
+        passwords produce the same `INVALID_CREDENTIALS` response. After 5
+        consecutive failures the email is locked out for 15 minutes
+        (`ACCOUNT_LOCKED`, 429 with Retry-After). Rate limited per IP (20/min).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+            example: { email: ada@irate.dev, password: Password123! }
+      responses:
+        "200":
+          description: Logged in.
+          headers:
+            Set-Cookie:
+              description: "`refreshToken=<opaque>; Path=/api/v1/auth; HttpOnly; SameSite=Strict; Secure (production); Max-Age=604800`"
+              schema: { type: string }
+            X-Request-ID: { $ref: "#/components/headers/X-Request-ID" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Session" }
+              example:
+                success: true
+                message: Login successful
+                data:
+                  accessToken: eyJhbGciOiJIUzI1NiIsImtpZCI6ImJlZWE5MjIyIiwidHlwIjoiSldUIn0.eyJzdWIiOiIuLi4ifQ.sig
+                  tokenType: Bearer
+                  expiresIn: 900
+                  user: { id: 01a1779c-93d6-7a73-b58c-d5ac22826ad5, email: ada@irate.dev, role: USER, createdAt: "2026-10-26T09:48:32.596Z" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshSession
+      summary: Rotate the refresh token and get a new access token
+      description: |
+        Reads the `refreshToken` cookie, rotates it (new cookie in Set-Cookie)
+        and returns a new access token. The user's role is re-read from the
+        database. Presenting an already-rotated token within the reuse grace
+        window (default 20s, e.g. two tabs racing) is refused without ending the
+        session; presenting it later is treated as theft and revokes every token
+        of that session. On any failure the cookie is cleared and
+        `INVALID_REFRESH_TOKEN` (401) is returned. Rate limited per IP (20/min).
+      security:
+        - refreshCookie: []
+      responses:
+        "200":
+          description: Refreshed.
+          headers:
+            Set-Cookie:
+              description: The rotated `refreshToken` cookie.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out of the current session
+      description: |
+        Works with either credential, so it also works when the access token has
+        already expired: a valid bearer token is denylisted until it expires, and
+        the refresh cookie's session is revoked. Always clears the cookie.
+      security:
+        - bearerAuth: []
+        - refreshCookie: []
+        - {}
+      responses:
+        "200":
+          description: Logged out.
+          headers:
+            Set-Cookie:
+              description: Clears the `refreshToken` cookie (`Max-Age=0`).
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NullDataEnvelope" }
+              example: { success: true, message: Logged out successfully, data: null }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/logout-all:
+    post:
+      tags: [Auth]
+      operationId: logoutAll
+      summary: Log out of every session on every device
+      description: Revokes all refresh tokens and every access token issued up to now.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: All sessions revoked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NullDataEnvelope" }
+              example: { success: true, message: Logged out of all sessions, data: null }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ------------------------------------------------------------------- users
+  /api/v1/users/me/overview:
+    get:
+      tags: [Users]
+      operationId: getMyOverview
+      summary: Customer home screen
+      description: Default-currency wallet, balance, KYC status, lifetime stats and the 5 most recent statement lines.
+      responses:
+        "200":
+          description: Overview.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Overview" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/users/me:
+    get:
+      tags: [Users]
+      operationId: getMe
+      summary: Current user's profile
+      responses:
+        "200": { $ref: "#/components/responses/ProfileOK" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/users/{userId}:
+    get:
+      tags: [Users]
+      operationId: getUserById
+      summary: A user's profile
+      description: |
+        Customers may only read their own profile; admins may read anyone's.
+        The permission check runs before the lookup, so a 403 never reveals
+        whether the id exists.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { $ref: "#/components/responses/ProfileOK" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ----------------------------------------------------------------- wallets
+  /api/v1/wallets:
+    post:
+      tags: [Wallets]
+      operationId: createWallet
+      summary: Open a wallet
+      description: Body is optional; `currency` defaults to the platform default (NGN). One wallet per user per currency.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWalletRequest" }
+            example: { currency: NGN }
+      responses:
+        "201":
+          description: Wallet created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Wallet" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [Wallets]
+      operationId: listMyWallets
+      summary: List my wallets
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Wallets.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/WalletList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/wallets/{walletId}/balance:
+    get:
+      tags: [Wallets]
+      operationId: getWalletBalance
+      summary: Wallet balance
+      description: Read straight from the ledger-backed balance (no cache). Another user's wallet returns 404, exactly like a missing one.
+      parameters:
+        - $ref: "#/components/parameters/WalletId"
+      responses:
+        "200":
+          description: Balance.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Balance" }
+              example:
+                success: true
+                message: Wallet balance retrieved
+                data: { walletId: 01a1779c-93d6-7a73-b58c-d5ac22826ad6, balance: "4800000", currency: NGN }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ------------------------------------------------------------ transactions
+  /api/v1/transactions/resolve/{accountNumber}:
+    get:
+      tags: [Transactions]
+      operationId: resolveAccount
+      summary: Name enquiry
+      description: |
+        Resolves a customer account number to the holder's display name so the
+        sender can confirm before paying. Only a VERIFIED KYC name is shown;
+        otherwise the capitalised email local part. Never returns email, balance
+        or ids. System accounts are not resolvable. Rate limited per user (30/min).
+      parameters:
+        - name: accountNumber
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[0-9]{10}$' }
+          example: "1000000002"
+      responses:
+        "200":
+          description: Resolved.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/ResolvedAccount" }
+              example:
+                success: true
+                message: Account resolved
+                data: { accountNumber: "1000000002", accountName: Bola Adeyemi }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/transactions/transfer:
+    post:
+      tags: [Transactions]
+      operationId: transfer
+      summary: Send money by account number
+      description: |
+        Debits the caller's default-currency wallet and credits the recipient in
+        one balanced, row-locked ledger posting. Returns the sender's new
+        statement line. Rules: no transfers to your own account; frozen wallets
+        cannot send; amount at most the configured single-transaction cap;
+        customers without VERIFIED KYC are capped per calendar day
+        (`DAILY_LIMIT_EXCEEDED`). Rate limited per user (20/min).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransferRequest" }
+            example: { toAccountNumber: "1000000002", amount: 250000, note: Rent share }
+      responses:
+        "200":
+          description: Transfer completed (or replayed).
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/Idempotent-Replayed" }
+            X-Request-ID: { $ref: "#/components/headers/X-Request-ID" }
+            RateLimit-Limit: { $ref: "#/components/headers/RateLimit-Limit" }
+            RateLimit-Remaining: { $ref: "#/components/headers/RateLimit-Remaining" }
+            RateLimit-Reset: { $ref: "#/components/headers/RateLimit-Reset" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/StatementEntry" }
+              example:
+                success: true
+                message: Transfer successful
+                data:
+                  id: 01a1779d-fe14-7b71-a6a6-6208159a0739
+                  transactionId: 01a1779d-fe13-79c0-a195-2169ebf8e58d
+                  reference: TRF-20261026-K3J9X2Q7M4N8P1R5
+                  kind: TRANSFER
+                  type: DEBIT
+                  direction: out
+                  amount: "250000"
+                  currency: NGN
+                  description: Transfer to 1000000002
+                  note: Rent share
+                  counterparty: { accountNumber: "1000000002", name: Bola Adeyemi }
+                  balanceAfter: "4550000"
+                  createdAt: "2026-10-26T09:50:01.123Z"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/transactions/me:
+    get:
+      tags: [Transactions]
+      operationId: listMyTransactions
+      summary: My statement (all wallets)
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/StatementOK" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/transactions/{walletId}/transactions:
+    get:
+      tags: [Transactions]
+      operationId: listWalletTransactions
+      summary: One wallet's statement
+      description: The caller must own the wallet (404 otherwise).
+      parameters:
+        - $ref: "#/components/parameters/WalletId"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/StatementOK" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # --------------------------------------------------------------------- kyc
+  /api/v1/kyc/submit:
+    post:
+      tags: [KYC]
+      operationId: submitKyc
+      summary: Submit (or resubmit) KYC
+      description: |
+        Creates a PENDING record, or resubmits one that was REJECTED.
+        PENDING → `KYC_PENDING` (409); VERIFIED → `KYC_ALREADY_VERIFIED` (409).
+        Applicants must be 18–120 years old; NIN and BVN must be exactly 11 digits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KYCSubmitRequest" }
+            example:
+              fullName: Ada Okafor
+              dateOfBirth: "1994-05-17"
+              address: 12 Admiralty Way, Lekki, Lagos
+              idType: NIN
+              idNumber: "12345678901"
+              documentUrl: https://files.irate.dev/ada-nin.png
+      responses:
+        "201":
+          description: Submitted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/KYCRecord" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/kyc/status:
+    get:
+      tags: [KYC]
+      operationId: getMyKyc
+      summary: My KYC record
+      description: 404 `KYC_NOT_FOUND` when nothing has been submitted yet.
+      responses:
+        "200":
+          description: KYC record.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/KYCRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------------------------------------------------------------- payments
+  /api/v1/payments/deposits:
+    post:
+      tags: [Payments]
+      operationId: initiateDeposit
+      summary: Start a wallet top-up
+      description: |
+        Creates a PENDING deposit with a unique reference and asks the payment
+        provider for a checkout URL. The Idempotency-Key maps to exactly one
+        deposit: retrying returns the same deposit (200 + Idempotent-Replayed),
+        and re-attempts the provider call if it failed the first time. The wallet
+        is credited later, when the provider's webhook confirms payment.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DepositRequest" }
+            example: { amount: 500000 }
+      responses:
+        "201":
+          description: Deposit created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DepositEnvelope" }
+              example:
+                success: true
+                message: Deposit initiated
+                data:
+                  id: 01a1779d-fef0-7a11-9c2e-1b6f0e8a3d10
+                  reference: DEP-20261026-NO3DGS5HC6AJYMAB
+                  provider: sandbox
+                  amount: "500000"
+                  currency: NGN
+                  status: PENDING
+                  checkoutUrl: http://localhost:8000/sandbox/checkout?reference=DEP-20261026-NO3DGS5HC6AJYMAB
+                  failureReason: null
+                  transactionId: null
+                  createdAt: "2026-10-26T09:50:04.001Z"
+                  completedAt: null
+        "200":
+          description: Existing deposit for this Idempotency-Key (replay).
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/Idempotent-Replayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DepositEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "502":
+          description: The payment provider could not be reached (`PAYMENT_PROVIDER_ERROR`). Retry with the same Idempotency-Key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    get:
+      tags: [Payments]
+      operationId: listMyDeposits
+      summary: List my deposits
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Deposits.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/DepositList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/payments/deposits/{depositId}:
+    get:
+      tags: [Payments]
+      operationId: getDeposit
+      summary: One of my deposits
+      parameters:
+        - $ref: "#/components/parameters/DepositId"
+      responses:
+        "200":
+          description: Deposit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DepositEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/payments/sandbox/deposits/{depositId}/simulate:
+    post:
+      tags: [Payments]
+      operationId: simulateSandboxPayment
+      summary: Simulate a sandbox payment (development only)
+      description: |
+        Only registered when `PAYMENTS_SANDBOX_SIMULATION=true` (never in
+        production; 404 otherwise). Builds a correctly signed sandbox webhook for
+        the caller's own deposit and runs it through the same verification and
+        settlement path as a real provider webhook.
+      parameters:
+        - $ref: "#/components/parameters/DepositId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SimulateRequest" }
+            example: { outcome: success }
+      responses:
+        "200":
+          description: The deposit after processing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DepositEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------------------------------------------------------------- webhooks
+  /api/v1/webhooks/payments/{provider}:
+    post:
+      tags: [Webhooks]
+      operationId: receivePaymentWebhook
+      summary: Inbound payment provider webhook
+      description: |
+        Unauthenticated: trust comes from the provider's signature. Events are
+        de-duplicated by provider event id and applied with compare-and-set under
+        a row lock, so a deposit is credited at most once no matter how many
+        times (or how concurrently) events are delivered.
+
+        **Sandbox signing** (`provider = sandbox`):
+        `X-Sandbox-Signature` = lowercase hex of HMAC-SHA256(secret, `"<X-Sandbox-Timestamp>." + rawBody`),
+        where `X-Sandbox-Timestamp` is Unix seconds. Timestamps more than 5
+        minutes from server time are rejected (replay protection).
+
+        **Paystack** (`provider = paystack`): `X-Paystack-Signature` = lowercase
+        hex of HMAC-SHA512(secret key, rawBody). Paystack webhooks carry no
+        timestamp, so every `charge.success` is additionally confirmed with
+        Paystack's `GET /transaction/verify/:reference` before crediting, and the
+        verified amount is the one that counts. If verification fails or is not
+        yet available, the API answers 502 without recording the event, so
+        Paystack's automatic redelivery succeeds later. Only `charge.success`
+        moves money; other events are acknowledged and ignored. Event identity
+        for de-duplication is `"<event>:<data.id>"`.
+
+        Outcomes: 200 for processed, duplicate, ignored event types, unknown
+        references and amount mismatches (flagged FAILED for manual review, never
+        credited) — retrying would not help. A 5xx asks the provider to retry.
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [sandbox, paystack] }
+        - name: X-Sandbox-Timestamp
+          in: header
+          required: false
+          description: Unix seconds (sandbox provider).
+          schema: { type: string, pattern: '^[0-9]+$' }
+          example: "1793008112"
+        - name: X-Sandbox-Signature
+          in: header
+          required: false
+          description: Hex HMAC-SHA256 over `"<timestamp>.<body>"` (sandbox provider).
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+        - name: X-Paystack-Signature
+          in: header
+          required: false
+          description: Hex HMAC-SHA512 of the raw body keyed with the Paystack secret key (paystack provider).
+          schema: { type: string, pattern: '^[0-9a-f]{128}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/SandboxWebhookPayload"
+                - $ref: "#/components/schemas/PaystackWebhookPayload"
+            examples:
+              sandbox:
+                value:
+                  id: evt_01a1779d-ff00-7000-8000-000000000001
+                  type: payment.succeeded
+                  data: { reference: DEP-20261026-NO3DGS5HC6AJYMAB, amount: 500000, currency: NGN }
+              paystack:
+                value:
+                  event: charge.success
+                  data: { id: 302961, status: success, reference: DEP-20261026-NO3DGS5HC6AJYMAB, amount: 500000, currency: NGN }
+      responses:
+        "200":
+          description: Acknowledged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NullDataEnvelope" }
+              example: { success: true, message: Webhook processed, data: null }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "502":
+          description: Payment could not be verified with the provider (`PAYMENT_PROVIDER_ERROR`); nothing was recorded and the provider should redeliver.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  # ------------------------------------------------------------------- admin
+  /api/v1/admin/dashboard/overview:
+    get:
+      tags: [Admin]
+      operationId: adminDashboardOverview
+      summary: Dashboard stat cards (ADMIN)
+      description: |
+        Requires ADMIN. Users exclude admins; balances exclude system accounts;
+        cashflow is money in minus money out of customer wallets (P2P transfers
+        net out); volume counts each transaction once. "Today" follows the
+        configured business timezone; transaction stats compare rolling 24h windows.
+      responses:
+        "200":
+          description: Overview.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/AdminOverview" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/me:
+    get:
+      tags: [Admin]
+      operationId: adminGetMe
+      summary: The admin's own profile (ADMIN)
+      responses:
+        "200": { $ref: "#/components/responses/ProfileOK" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/users:
+    get:
+      tags: [Admin]
+      operationId: adminListUsers
+      summary: User directory (ADMIN)
+      description: Requires ADMIN. Case-insensitive search over email and KYC full name (LIKE wildcards in input are escaped).
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+        - name: search
+          in: query
+          required: false
+          schema: { type: string, maxLength: 100 }
+          example: ada
+      responses:
+        "200":
+          description: Users.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/AdminUserList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/users/stats:
+    get:
+      tags: [Admin]
+      operationId: adminUsersStats
+      summary: Customer count and sign-up trend (ADMIN)
+      responses:
+        "200": { $ref: "#/components/responses/StatCardOK" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/wallets/balance:
+    get:
+      tags: [Admin]
+      operationId: adminWalletsBalance
+      summary: Total customer balance and inflow trend (ADMIN)
+      responses:
+        "200": { $ref: "#/components/responses/StatCardOK" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/credit/{walletId}:
+    post:
+      tags: [Admin]
+      operationId: adminCreditWallet
+      summary: Credit a customer wallet (ADMIN)
+      description: |
+        Requires ADMIN. Posts a balanced journal from the ADJUSTMENTS system
+        account to the customer wallet. The reason is shown on the customer's
+        statement. Admins cannot credit their own wallet (403).
+      parameters:
+        - $ref: "#/components/parameters/WalletId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreditRequest" }
+            example: { amount: 500000, reason: "Goodwill: failed card refund" }
+      responses:
+        "200":
+          description: Credited (or replayed).
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/Idempotent-Replayed" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/CreditResult" }
+              example:
+                success: true
+                message: Wallet credited successfully
+                data:
+                  walletId: 01a1779c-93d6-7a73-b58c-d5ac22826ad6
+                  accountNumber: "1000000003"
+                  amount: "500000"
+                  balance: "500000"
+                  currency: NGN
+                  transactionId: 01a1779d-fe13-79c0-a195-2169ebf8e58e
+                  reference: ADJ-20261026-ISA22IQSZ6A2CZP5
+                  createdAt: "2026-10-26T09:50:02.000Z"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/wallets/{walletId}/status:
+    patch:
+      tags: [Admin]
+      operationId: adminSetWalletStatus
+      summary: Freeze or unfreeze a wallet (ADMIN)
+      description: Requires ADMIN. FROZEN is "post no debit" — the wallet can still receive money but cannot send.
+      parameters:
+        - $ref: "#/components/parameters/WalletId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WalletStatusRequest" }
+            example: { status: FROZEN, reason: Suspicious activity under review }
+      responses:
+        "200":
+          description: Updated wallet.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Wallet" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/reconciliation:
+    get:
+      tags: [Admin]
+      operationId: adminReconciliation
+      summary: Ledger reconciliation (ADMIN)
+      description: |
+        Requires ADMIN. Checks three invariants that must always hold: every
+        journal is balanced, every wallet balance equals the sum of its entries,
+        and each currency nets to zero across customer and system accounts.
+      responses:
+        "200":
+          description: Reconciliation report.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/Reconciliation" }
+              example:
+                success: true
+                message: Reconciliation completed
+                data: { healthy: true, unbalancedTransactions: 0, walletMismatches: [], nonZeroCurrencies: [], checkedAt: "2026-10-26T09:50:05.601Z" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/kyc:
+    get:
+      tags: [Admin]
+      operationId: adminListKyc
+      summary: KYC review queue (ADMIN)
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/KYCStatus" }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: KYC submissions.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/AdminKYCList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/v1/admin/kyc/{kycId}/review:
+    patch:
+      tags: [Admin]
+      operationId: adminReviewKyc
+      summary: Approve or reject a KYC submission (ADMIN)
+      description: |
+        Requires ADMIN. Compare-and-set on PENDING: a decided record returns
+        `KYC_ALREADY_REVIEWED` (409), and of two concurrent reviews exactly one
+        wins. Admins cannot review their own submission (403). Message is
+        "KYC approved" or "KYC rejected".
+      parameters:
+        - name: kycId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KYCReviewRequest" }
+            example: { action: REJECT, reason: Document unreadable }
+      responses:
+        "200":
+          description: Reviewed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - properties:
+                      data: { $ref: "#/components/schemas/KYCRecord" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute HS256 access token from login/refresh. Claims include sub (user id), email, role, jti.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refreshToken
+      description: Opaque refresh token set by login/refresh (HttpOnly, SameSite=Strict, Path=/api/v1/auth).
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Unique key per operation (1–255 visible ASCII characters; a UUID is
+        recommended). Same key + same payload replays the original response;
+        same key + different payload → `IDEMPOTENCY_KEY_REUSED` (422). Missing →
+        `IDEMPOTENCY_KEY_REQUIRED` (400).
+      schema: { type: string, minLength: 1, maxLength: 255, pattern: '^[\x21-\x7E]+$' }
+      example: 3f1c2b9e-8a4d-4e1f-9b7a-2c6d8e0f1a2b
+    Page:
+      name: page
+      in: query
+      required: false
+      description: 1-based page. Invalid values fall back to 1.
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Invalid values fall back to 10; values above 100 are clamped to 100.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+    WalletId:
+      name: walletId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DepositId:
+      name: depositId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  headers:
+    X-Request-ID:
+      description: Request id (echoed from a well-formed inbound X-Request-ID, else generated). Also in every error body.
+      schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,64}$' }
+    Idempotent-Replayed:
+      description: "`true` when the response was served from a stored idempotent result (no money moved this time)."
+      schema: { type: string, enum: ["true"] }
+    RateLimit-Limit:
+      description: Requests allowed per window for this policy.
+      schema: { type: integer }
+    RateLimit-Remaining:
+      description: Requests remaining in the current window.
+      schema: { type: integer }
+    RateLimit-Reset:
+      description: Seconds until the limit fully resets.
+      schema: { type: integer }
+    Retry-After:
+      description: Seconds to wait before retrying (on 429).
+      schema: { type: integer }
+
+  responses:
+    Liveness:
+      description: Process is alive.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status, timestamp]
+            properties:
+              status: { type: string, const: ok }
+              timestamp: { type: string, format: date-time }
+          example: { status: ok, timestamp: "2026-10-26T09:49:39.537Z" }
+    ProfileOK:
+      description: Profile.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/SuccessEnvelope"
+              - properties:
+                  data: { $ref: "#/components/schemas/Profile" }
+    StatementOK:
+      description: Statement page.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/SuccessEnvelope"
+              - properties:
+                  data: { $ref: "#/components/schemas/StatementPage" }
+    StatCardOK:
+      description: Stat card.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/SuccessEnvelope"
+              - properties:
+                  data: { $ref: "#/components/schemas/StatCard" }
+    BadRequest:
+      description: Malformed request or validation failure (`VALIDATION_ERROR`, `BAD_REQUEST`, `IDEMPOTENCY_KEY_REQUIRED`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example:
+            success: false
+            message: "amount: must be a positive whole number of minor units, e.g. 150000 for 1,500.00"
+            code: VALIDATION_ERROR
+            errors: [{ field: amount, message: "must be a positive whole number of minor units, e.g. 150000 for 1,500.00" }]
+            requestId: c4c7721de945e6333183560e
+    Unauthorized:
+      description: Missing, invalid, expired or revoked credentials.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { success: false, message: Your access token has expired., code: ACCESS_TOKEN_EXPIRED, requestId: b8c410b9a8db39e6de652275 }
+    Forbidden:
+      description: Authenticated but not allowed (e.g. not an ADMIN).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { success: false, message: You do not have permission to perform this action., code: FORBIDDEN, requestId: b8c410b9a8db39e6de652275 }
+    NotFound:
+      description: Resource (or route) not found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { success: false, message: Recipient account not found., code: RECIPIENT_NOT_FOUND, requestId: b8c410b9a8db39e6de652275 }
+    Conflict:
+      description: Conflicts with current state (`EMAIL_TAKEN`, `WALLET_EXISTS`, `KYC_PENDING`, `KYC_ALREADY_VERIFIED`, `KYC_ALREADY_REVIEWED`, `IDEMPOTENCY_KEY_IN_PROGRESS`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { success: false, message: An account with this email already exists., code: EMAIL_TAKEN, requestId: b8c410b9a8db39e6de652275 }
+    Unprocessable:
+      description: Well-formed request that breaks a business rule.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          examples:
+            insufficient:
+              value: { success: false, message: Insufficient balance., code: INSUFFICIENT_FUNDS, requestId: b8c410b9a8db39e6de652275 }
+            dailyLimit:
+              value:
+                success: false
+                message: "Unverified accounts can send up to NGN 50,000.00 per day (remaining today: NGN 0.00). Complete KYC verification to remove this limit."
+                code: DAILY_LIMIT_EXCEEDED
+                requestId: b8c410b9a8db39e6de652275
+    UnsupportedMediaType:
+      description: Content-Type is not application/json.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    PayloadTooLarge:
+      description: Body exceeds 1 MiB.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    TooManyRequests:
+      description: Rate limited (`RATE_LIMITED`) or login locked out (`ACCOUNT_LOCKED`).
+      headers:
+        Retry-After: { $ref: "#/components/headers/Retry-After" }
+        RateLimit-Limit: { $ref: "#/components/headers/RateLimit-Limit" }
+        RateLimit-Remaining: { $ref: "#/components/headers/RateLimit-Remaining" }
+        RateLimit-Reset: { $ref: "#/components/headers/RateLimit-Reset" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ServiceUnavailable:
+      description: Dependency unavailable, wallet lock busy, or request timed out (`SERVICE_UNAVAILABLE`, `REQUEST_TIMEOUT`). Safe to retry.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    InternalError:
+      description: Unexpected failure. Details are logged server-side and never returned.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { success: false, message: Something went wrong on our side. Please try again., code: INTERNAL_ERROR, requestId: b8c410b9a8db39e6de652275 }
+
+  schemas:
+    # ------------------------------------------------------------ primitives
+    MoneyMinor:
+      type: string
+      pattern: '^-?\d+$'
+      description: Integer amount in minor units, as a string.
+      examples: ["250000"]
+    AmountInput:
+      description: Positive integer amount in minor units, as a JSON integer or an integer string.
+      oneOf:
+        - type: integer
+          format: int64
+          minimum: 1
+        - type: string
+          pattern: '^\d+$'
+      examples: [250000, "250000"]
+    AccountNumber:
+      type: string
+      pattern: '^[0-9]{10}$'
+      examples: ["1000000002"]
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      examples: [NGN]
+    UserRole:
+      type: string
+      enum: [USER, ADMIN]
+    KYCStatus:
+      type: string
+      enum: [PENDING, VERIFIED, REJECTED]
+    PageMeta:
+      type: object
+      required: [total, page, limit, totalPages, hasNextPage, hasPrevPage]
+      properties:
+        total: { type: integer, format: int64 }
+        page: { type: integer }
+        limit: { type: integer }
+        totalPages: { type: integer }
+        hasNextPage: { type: boolean }
+        hasPrevPage: { type: boolean }
+
+    # ------------------------------------------------------------ envelopes
+    SuccessEnvelope:
+      type: object
+      required: [success, message, data]
+      properties:
+        success: { type: boolean, const: true }
+        message: { type: string }
+        data: {}
+    NullDataEnvelope:
+      type: object
+      required: [success, message, data]
+      properties:
+        success: { type: boolean, const: true }
+        message: { type: string }
+        data: { type: "null" }
+    ErrorCode:
+      type: string
+      description: Machine-readable error code. Clients branch on this, never on `message`.
+      enum:
+        - VALIDATION_ERROR
+        - BAD_REQUEST
+        - UNSUPPORTED_MEDIA_TYPE
+        - METHOD_NOT_ALLOWED
+        - PAYLOAD_TOO_LARGE
+        - UNAUTHORIZED
+        - INVALID_CREDENTIALS
+        - ACCESS_TOKEN_EXPIRED
+        - INVALID_ACCESS_TOKEN
+        - INVALID_REFRESH_TOKEN
+        - FORBIDDEN
+        - NOT_FOUND
+        - CONFLICT
+        - RATE_LIMITED
+        - ACCOUNT_LOCKED
+        - SERVICE_UNAVAILABLE
+        - REQUEST_TIMEOUT
+        - INTERNAL_ERROR
+        - EMAIL_TAKEN
+        - WALLET_EXISTS
+        - WALLET_NOT_FOUND
+        - WALLET_FROZEN
+        - UNSUPPORTED_CURRENCY
+        - CURRENCY_MISMATCH
+        - INSUFFICIENT_FUNDS
+        - AMOUNT_TOO_LARGE
+        - DAILY_LIMIT_EXCEEDED
+        - SELF_TRANSFER
+        - RECIPIENT_NOT_FOUND
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - IDEMPOTENCY_KEY_IN_PROGRESS
+        - KYC_PENDING
+        - KYC_ALREADY_VERIFIED
+        - KYC_NOT_FOUND
+        - KYC_ALREADY_REVIEWED
+        - PAYMENT_PROVIDER_ERROR
+        - INVALID_SIGNATURE
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field: { type: string, examples: [amount] }
+        message: { type: string, examples: [is required] }
+    ErrorEnvelope:
+      type: object
+      required: [success, message, code]
+      properties:
+        success: { type: boolean, const: false }
+        message: { type: string }
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        errors:
+          type: array
+          description: Present for VALIDATION_ERROR, one entry per invalid field.
+          items: { $ref: "#/components/schemas/FieldError" }
+        requestId: { type: string }
+
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ready, degraded, draining] }
+        checks:
+          type: object
+          properties:
+            database: { type: string, enum: [ok, unavailable] }
+            redis: { type: string, enum: [ok, unavailable] }
+
+    # ----------------------------------------------------------------- auth
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: At least one upper-case letter, one lower-case letter and one digit.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, maxLength: 128 }
+    AuthUser:
+      type: object
+      required: [id, email, role, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/UserRole" }
+        createdAt: { type: string, format: date-time }
+    RegisterResult:
+      type: object
+      required: [user, accountNumber]
+      properties:
+        user: { $ref: "#/components/schemas/AuthUser" }
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+    Session:
+      type: object
+      required: [accessToken, tokenType, expiresIn, user]
+      properties:
+        accessToken: { type: string }
+        tokenType: { type: string, const: Bearer }
+        expiresIn: { type: integer, description: Access-token lifetime in seconds., examples: [900] }
+        user: { $ref: "#/components/schemas/AuthUser" }
+
+    # --------------------------------------------------------------- wallets
+    CreateWalletRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        currency: { $ref: "#/components/schemas/Currency" }
+    Wallet:
+      type: object
+      required: [id, userId, accountNumber, balance, currency, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        balance: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        status: { type: string, enum: [ACTIVE, FROZEN] }
+        createdAt: { type: string, format: date-time }
+    WalletList:
+      type: object
+      required: [wallets, pagination]
+      properties:
+        wallets:
+          type: array
+          items: { $ref: "#/components/schemas/Wallet" }
+        pagination: { $ref: "#/components/schemas/PageMeta" }
+    Balance:
+      type: object
+      required: [walletId, balance, currency]
+      properties:
+        walletId: { type: string, format: uuid }
+        balance: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+    ResolvedAccount:
+      type: object
+      required: [accountNumber, accountName]
+      properties:
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        accountName: { type: string, examples: [Bola Adeyemi] }
+
+    # ---------------------------------------------------------- transactions
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [toAccountNumber, amount]
+      properties:
+        toAccountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        amount: { $ref: "#/components/schemas/AmountInput" }
+        note: { type: string, maxLength: 140, description: Optional; trimmed; no control characters. }
+    Counterparty:
+      type: object
+      required: [accountNumber, name]
+      properties:
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        name: { type: string }
+    StatementEntry:
+      type: object
+      description: One bank-statement line from the viewing wallet's point of view.
+      required: [id, transactionId, reference, kind, type, direction, amount, currency, description, note, counterparty, balanceAfter, createdAt]
+      properties:
+        id: { type: string, format: uuid, description: Ledger entry id. }
+        transactionId: { type: string, format: uuid }
+        reference: { type: string, examples: [TRF-20261026-K3J9X2Q7M4N8P1R5] }
+        kind: { type: string, enum: [TRANSFER, DEPOSIT, ADMIN_CREDIT] }
+        type: { type: string, enum: [CREDIT, DEBIT] }
+        direction: { type: string, enum: [in, out] }
+        amount: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        description: { type: string, examples: [Transfer to 1000000002] }
+        note: { type: [string, "null"] }
+        counterparty:
+          description: The other customer; null for movements against system accounts (deposits, admin credits).
+          oneOf:
+            - $ref: "#/components/schemas/Counterparty"
+            - type: "null"
+        balanceAfter: { $ref: "#/components/schemas/MoneyMinor" }
+        createdAt: { type: string, format: date-time }
+    StatementPage:
+      type: object
+      required: [transactions, pagination]
+      properties:
+        transactions:
+          type: array
+          items: { $ref: "#/components/schemas/StatementEntry" }
+        pagination: { $ref: "#/components/schemas/PageMeta" }
+
+    # ----------------------------------------------------------------- users
+    Profile:
+      type: object
+      required: [id, email, role, kyc, wallets, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/UserRole" }
+        kycStatus:
+          description: Omitted when no KYC record exists.
+          allOf:
+            - $ref: "#/components/schemas/KYCStatus"
+        kyc:
+          oneOf:
+            - $ref: "#/components/schemas/KYCRecord"
+            - type: "null"
+        wallets:
+          type: array
+          items: { $ref: "#/components/schemas/Wallet" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    Overview:
+      type: object
+      required: [walletId, accountNumber, balance, currency, walletStatus, kycStatus, stats, recentTransactions]
+      properties:
+        walletId: { type: string, format: uuid }
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        balance: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        walletStatus: { type: string, enum: [ACTIVE, FROZEN] }
+        kycStatus:
+          oneOf:
+            - $ref: "#/components/schemas/KYCStatus"
+            - type: "null"
+        stats:
+          type: object
+          required: [totalIn, totalOut, transactionCount]
+          properties:
+            totalIn: { $ref: "#/components/schemas/MoneyMinor" }
+            totalOut: { $ref: "#/components/schemas/MoneyMinor" }
+            transactionCount: { type: integer, format: int64 }
+        recentTransactions:
+          type: array
+          maxItems: 5
+          items: { $ref: "#/components/schemas/StatementEntry" }
+
+    # ------------------------------------------------------------------- kyc
+    KYCSubmitRequest:
+      type: object
+      additionalProperties: false
+      required: [fullName, dateOfBirth, address, idType, idNumber]
+      properties:
+        fullName: { type: string, minLength: 2, maxLength: 120 }
+        dateOfBirth:
+          type: string
+          description: "`YYYY-MM-DD` or an RFC 3339 timestamp (date part used). Applicant must be 18–120 years old."
+          examples: ["1994-05-17"]
+        address: { type: string, minLength: 5, maxLength: 200 }
+        idType: { type: string, enum: [NIN, BVN, PASSPORT, DRIVERS_LICENSE, VOTERS_CARD] }
+        idNumber: { type: string, minLength: 4, maxLength: 40, description: Exactly 11 digits for NIN and BVN. }
+        documentUrl: { type: string, format: uri, maxLength: 2048, description: http(s) URL. }
+    KYCRecord:
+      type: object
+      required: [id, userId, fullName, dateOfBirth, address, idType, idNumber, documentUrl, status, rejectionReason, reviewedAt, verifiedAt, submittedAt, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        fullName: { type: string }
+        dateOfBirth: { type: string, format: date }
+        address: { type: string }
+        idType: { type: string }
+        idNumber: { type: string }
+        documentUrl: { type: [string, "null"] }
+        status: { $ref: "#/components/schemas/KYCStatus" }
+        rejectionReason: { type: [string, "null"] }
+        reviewedAt: { type: [string, "null"], format: date-time }
+        verifiedAt: { type: [string, "null"], format: date-time }
+        submittedAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    KYCReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action: { type: string, enum: [APPROVE, REJECT] }
+        reason: { type: string, maxLength: 500, description: Stored as the rejection reason when rejecting. }
+    AdminKYCRecord:
+      allOf:
+        - $ref: "#/components/schemas/KYCRecord"
+        - type: object
+          required: [user]
+          properties:
+            user:
+              type: object
+              required: [id, email, role]
+              properties:
+                id: { type: string, format: uuid }
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/UserRole" }
+    AdminKYCList:
+      type: object
+      required: [kycs, pagination]
+      properties:
+        kycs:
+          type: array
+          items: { $ref: "#/components/schemas/AdminKYCRecord" }
+        pagination: { $ref: "#/components/schemas/PageMeta" }
+
+    # -------------------------------------------------------------- payments
+    DepositRequest:
+      type: object
+      additionalProperties: false
+      required: [amount]
+      properties:
+        amount: { $ref: "#/components/schemas/AmountInput" }
+        currency: { $ref: "#/components/schemas/Currency" }
+    Deposit:
+      type: object
+      required: [id, reference, provider, amount, currency, status, checkoutUrl, failureReason, transactionId, createdAt, completedAt]
+      properties:
+        id: { type: string, format: uuid }
+        reference: { type: string, examples: [DEP-20261026-NO3DGS5HC6AJYMAB] }
+        provider: { type: string, examples: [sandbox] }
+        amount: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        status: { type: string, enum: [PENDING, SUCCEEDED, FAILED] }
+        checkoutUrl: { type: [string, "null"], format: uri }
+        failureReason: { type: [string, "null"] }
+        transactionId: { type: [string, "null"], format: uuid }
+        createdAt: { type: string, format: date-time }
+        completedAt: { type: [string, "null"], format: date-time }
+    DepositEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/SuccessEnvelope"
+        - properties:
+            data: { $ref: "#/components/schemas/Deposit" }
+    DepositList:
+      type: object
+      required: [deposits, pagination]
+      properties:
+        deposits:
+          type: array
+          items: { $ref: "#/components/schemas/Deposit" }
+        pagination: { $ref: "#/components/schemas/PageMeta" }
+    SimulateRequest:
+      type: object
+      additionalProperties: false
+      required: [outcome]
+      properties:
+        outcome: { type: string, enum: [success, failure] }
+    SandboxWebhookPayload:
+      type: object
+      required: [id, type, data]
+      properties:
+        id: { type: string, description: Unique provider event id (de-duplication key). }
+        type: { type: string, description: "`payment.succeeded`, `payment.failed`; other types are acknowledged and ignored.", examples: [payment.succeeded] }
+        data:
+          type: object
+          required: [reference, amount, currency]
+          properties:
+            reference: { type: string }
+            amount: { type: integer, format: int64, description: Minor units actually collected. }
+            currency: { $ref: "#/components/schemas/Currency" }
+            failureReason: { type: string }
+
+    PaystackWebhookPayload:
+      type: object
+      required: [event, data]
+      description: Subset of a Paystack webhook body used by the API.
+      properties:
+        event: { type: string, examples: [charge.success] }
+        data:
+          type: object
+          required: [reference]
+          properties:
+            id: { type: integer, format: int64, description: Paystack transaction id. }
+            status: { type: string, examples: [success] }
+            reference: { type: string, description: Our deposit reference. }
+            amount: { type: integer, format: int64, description: Subunits (kobo). }
+            currency: { type: string, examples: [NGN] }
+            gateway_response: { type: string }
+
+    # ----------------------------------------------------------------- admin
+    StatCard:
+      type: object
+      required: [title, value]
+      properties:
+        title: { type: string, examples: [Total Users] }
+        value:
+          description: A count (integer) or money (minor-unit string).
+          oneOf:
+            - type: integer
+              format: int64
+            - $ref: "#/components/schemas/MoneyMinor"
+        trend: { type: number, description: "Percent change, one decimal." }
+        trendType: { type: string, enum: [up, down, neutral] }
+        currency: { $ref: "#/components/schemas/Currency" }
+        wallets: { type: integer, format: int64 }
+        credit: { $ref: "#/components/schemas/MoneyMinor" }
+        debit: { $ref: "#/components/schemas/MoneyMinor" }
+    AdminOverview:
+      type: object
+      required: [usersStats, walletsBalance, transactionStats, totalCashflow, transactionVolume]
+      properties:
+        usersStats: { $ref: "#/components/schemas/StatCard" }
+        walletsBalance: { $ref: "#/components/schemas/StatCard" }
+        transactionStats: { $ref: "#/components/schemas/StatCard" }
+        totalCashflow: { $ref: "#/components/schemas/StatCard" }
+        transactionVolume: { $ref: "#/components/schemas/StatCard" }
+    AdminUserRow:
+      type: object
+      required: [id, email, role, createdAt, kyc, wallets]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/UserRole" }
+        createdAt: { type: string, format: date-time }
+        kyc:
+          oneOf:
+            - type: object
+              required: [id, status, verifiedAt]
+              properties:
+                id: { type: string, format: uuid }
+                status: { $ref: "#/components/schemas/KYCStatus" }
+                verifiedAt: { type: [string, "null"], format: date-time }
+            - type: "null"
+        wallets:
+          type: array
+          items: { $ref: "#/components/schemas/Wallet" }
+    AdminUserList:
+      type: object
+      required: [users, pagination]
+      properties:
+        users:
+          type: array
+          items: { $ref: "#/components/schemas/AdminUserRow" }
+        pagination: { $ref: "#/components/schemas/PageMeta" }
+    CreditRequest:
+      type: object
+      additionalProperties: false
+      required: [amount, reason]
+      properties:
+        amount: { $ref: "#/components/schemas/AmountInput" }
+        reason: { type: string, minLength: 1, maxLength: 200, description: Shown on the customer's statement. }
+    CreditResult:
+      type: object
+      required: [walletId, accountNumber, amount, balance, currency, transactionId, reference, createdAt]
+      properties:
+        walletId: { type: string, format: uuid }
+        accountNumber: { $ref: "#/components/schemas/AccountNumber" }
+        amount: { $ref: "#/components/schemas/MoneyMinor" }
+        balance: { $ref: "#/components/schemas/MoneyMinor" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        transactionId: { type: string, format: uuid }
+        reference: { type: string, examples: [ADJ-20261026-ISA22IQSZ6A2CZP5] }
+        createdAt: { type: string, format: date-time }
+    WalletStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status, reason]
+      properties:
+        status: { type: string, enum: [ACTIVE, FROZEN] }
+        reason: { type: string, minLength: 1, maxLength: 200 }
+    Reconciliation:
+      type: object
+      required: [healthy, unbalancedTransactions, walletMismatches, nonZeroCurrencies, checkedAt]
+      properties:
+        healthy: { type: boolean }
+        unbalancedTransactions: { type: integer, format: int64 }
+        walletMismatches:
+          type: array
+          items:
+            type: object
+            required: [walletId, accountNumber, kind, currency, balance, ledgerBalance]
+            properties:
+              walletId: { type: string, format: uuid }
+              accountNumber: { type: string }
+              kind: { type: string, enum: [USER, SYSTEM] }
+              currency: { $ref: "#/components/schemas/Currency" }
+              balance: { $ref: "#/components/schemas/MoneyMinor" }
+              ledgerBalance: { $ref: "#/components/schemas/MoneyMinor" }
+        nonZeroCurrencies:
+          type: array
+          items:
+            type: object
+            required: [currency, net]
+            properties:
+              currency: { $ref: "#/components/schemas/Currency" }
+              net: { $ref: "#/components/schemas/MoneyMinor" }
+        checkedAt: { type: string, format: date-time }
