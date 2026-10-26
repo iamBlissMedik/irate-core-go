@@ -1,0 +1,66 @@
+# Local stack: Postgres + Redis + migrations + API.
+#   docker compose up --build         # API on http://localhost:8000
+#   docker compose run --rm seed      # load demo data
+# Host ports 5433/6380 avoid clashing with a locally installed Postgres/Redis.
+name: irate-core-go
+
+x-api-env: &api-env
+  APP_ENV: development
+  DATABASE_URL: postgres://irate:irate@postgres:5432/irate?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+  JWT_ACCESS_SECRET: compose-dev-access-secret-change-me-0123456789
+  SANDBOX_WEBHOOK_SECRET: compose-dev-webhook-secret-change-me-0123456
+  CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:9000
+  PUBLIC_BASE_URL: http://localhost:8000
+  LOG_FORMAT: text
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: irate
+      POSTGRES_PASSWORD: irate
+      POSTGRES_DB: irate
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U irate -d irate"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    entrypoint: ["/app/migrate", "up"]
+    environment: *api-env
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    build: .
+    environment: *api-env
+    ports: ["8000:8000"] # metrics stay on the internal network (9090)
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  seed:
+    build: .
+    entrypoint: ["/app/seed"]
+    environment: *api-env
+    profiles: [tools]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
